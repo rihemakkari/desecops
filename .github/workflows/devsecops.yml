@@ -1,0 +1,245 @@
+name: DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  PROJECT_KEY: devsecops-demo
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}    # e.g. http://your-sonar:9000 (store as secret)
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}          # Sonar token (store as secret)
+  IMAGE_NAME: devsecops-app:latest
+  APP_PORT: 5000
+  APP_URL: http://localhost:5000                    # adjust if needed
+  SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}      # optional: Slack webhook (store as secret)
+
+jobs:
+  devsecops:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # ---------------------------
+    # Build Docker image
+    # ---------------------------
+    - name: Build Docker image
+      run: |
+        docker build -t $IMAGE_NAME .
+
+    # ---------------------------
+    # Unit tests & coverage
+    # ---------------------------
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Create venv & install deps
+      run: |
+        python -m venv venv
+        source venv/bin/activate
+        pip install -r requirements.txt || true
+        pip install pytest pytest-cov
+
+    - name: Run tests and generate coverage.xml
+      run: |
+        source venv/bin/activate
+        pytest --cov=. --cov-report=xml
+
+    - name: Upload coverage.xml (artifact)
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-xml
+        path: coverage.xml
+
+    # ---------------------------
+    # SAST: SonarQube scan + quality gate
+    # ---------------------------
+    - name: Install SonarScanner
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y unzip
+        wget -qO sonar-scanner.zip https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-5.0.1.3006-linux.zip
+        unzip sonar-scanner.zip
+        sudo mv sonar-scanner-*/ /opt/sonar-scanner
+        sudo ln -s /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner
+
+    - name: Run SonarScanner
+      id: sonar
+      env:
+        SONAR_LOGIN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      run: |
+        sonar-scanner \
+          -Dsonar.projectKey=${{ env.PROJECT_KEY }} \
+          -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
+          -Dsonar.sources=. \
+          -Dsonar.python.coverage.reportPaths=coverage.xml \
+          -Dsonar.login=${{ env.SONAR_LOGIN }} \
+          -Dsonar.tests=.
+        # store project key for next step
+        echo "projectKey=${{ env.PROJECT_KEY }}" >> $GITHUB_OUTPUT
+
+    - name: Wait for SonarQube quality gate
+      env:
+        SONAR_LOGIN: ${{ secrets.SONAR_TOKEN }}
+        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      run: |
+        PROJECT=${{ env.PROJECT_KEY }}
+        echo "Checking SonarQube quality gate for project=$PROJECT"
+        for i in $(seq 1 60); do
+          status=$(curl -s -u "${SONAR_LOGIN}:" "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${PROJECT}" | jq -r '.projectStatus.status')
+          echo "Attempt $i: SonarQube quality gate status = $status"
+          if [ "$status" != "PENDING" ]; then
+            break
+          fi
+          sleep 5
+        done
+        if [ "$status" = "OK" ]; then
+          echo "SonarQube quality gate PASSED"
+        else
+          echo "SonarQube quality gate FAILED (status=$status)"
+          # fail the job (blocking)
+          exit 1
+        fi
+
+    # ---------------------------
+    # SCA & Docker scan: Trivy
+    # ---------------------------
+    - name: Install Trivy
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y trivy
+
+    - name: Trivy: Scan image (fail on HIGH/CRITICAL)
+      run: |
+        # fail if any HIGH or CRITICAL vuln found
+        trivy image --exit-code 1 --severity HIGH,CRITICAL --format json -o trivy-report.json $IMAGE_NAME || true
+        trivy image --format table -o trivy-report.txt $IMAGE_NAME || true
+        echo "Checking trivy-report.json for HIGH/CRITICAL vulnerabilities..."
+        if jq -e '.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH" or .Severity=="CRITICAL")' trivy-report.json >/dev/null 2>&1; then
+          echo "Found HIGH/CRITICAL vulnerabilities in image. Failing pipeline."
+          cat trivy-report.txt || true
+          exit 1
+        fi
+        echo "No HIGH/CRITICAL vulnerabilities found by Trivy."
+
+    - name: Upload Trivy reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: trivy-reports
+        path: |
+          trivy-report.json
+          trivy-report.txt
+
+    # ---------------------------
+    # Start app container for DAST
+    # ---------------------------
+    - name: Start container for app (staging) on port ${{ env.APP_PORT }}
+      run: |
+        docker run -d --name devsecops-staging -p ${APP_PORT}:$APP_PORT $IMAGE_NAME
+        # wait for app
+        echo "Waiting for app to respond at ${APP_URL}..."
+        for i in $(seq 1 30); do
+          if curl -sS --max-time 2 ${APP_URL} >/dev/null 2>&1; then
+            echo "App is up"
+            break
+          fi
+          echo "Waiting..."
+          sleep 2
+        done
+
+    # ---------------------------
+    # DAST: OWASP ZAP scan (JSON) and fail on MEDIUM/HIGH
+    # ---------------------------
+    - name: Run ZAP full scan (docker)
+      run: |
+        docker run --rm -v "$(pwd)":/zap/wrk/:rw -u $(id -u):$(id -g) \
+          ghcr.io/zaproxy/zaproxy:stable zap-full-scan.py -t ${APP_URL} -r zap-report.html -J zap-report.json
+        echo "ZAP report generated: zap-report.json"
+
+    - name: Check ZAP findings and fail on MEDIUM or HIGH
+      run: |
+        jq -r '.site[]?.alerts[]? | "\(.risk) \(.name)"' zap-report.json > zap-alerts.txt || true
+        echo "ZAP Alert summary:"
+        cat zap-alerts.txt || true
+        # count MEDIUM or HIGH
+        count=$(jq '[.site[]?.alerts[]? | select(.risk=="High" or .risk=="Medium")] | length' zap-report.json)
+        echo "Number of Medium/High alerts: $count"
+        if [ "$count" -gt 0 ]; then
+          echo "DAST found $count MEDIUM/HIGH alerts — failing pipeline."
+          exit 1
+        fi
+        echo "No MEDIUM/HIGH DAST alerts found."
+
+    - name: Upload ZAP reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: zap-reports
+        path: |
+          zap-report.html
+          zap-report.json
+          zap-alerts.txt
+
+    - name: Stop and remove staging container
+      if: always()
+      run: |
+        docker rm -f devsecops-staging || true
+
+    # ---------------------------
+    # Secrets scan: Gitleaks
+    # ---------------------------
+    - name: Install Gitleaks
+      run: |
+        curl -sSL https://github.com/gitleaks/gitleaks/releases/latest/download/gitleaks-linux-amd64 -o gitleaks
+        chmod +x gitleaks
+        sudo mv gitleaks /usr/local/bin/
+
+    - name: Run Gitleaks (fail on any findings)
+      run: |
+        gitleaks detect --source=. --report-path=gitleaks-report.json --report-format json || true
+        if [ -s gitleaks-report.json ]; then
+          echo "Gitleaks found leaks — failing pipeline."
+          cat gitleaks-report.json
+          exit 1
+        fi
+        echo "No secrets found by gitleaks."
+
+    - name: Upload Gitleaks report
+      uses: actions/upload-artifact@v3
+      with:
+        name: gitleaks-report
+        path: gitleaks-report.json
+
+    # ---------------------------
+    # Final: aggregate reports + Slack notification
+    # ---------------------------
+    - name: Archive all security reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-reports
+        path: |
+          coverage.xml
+          trivy-report.json
+          trivy-report.txt
+          zap-report.html
+          zap-report.json
+          gitleaks-report.json
+
+    - name: Notify Slack (success)
+      if: success() && env.SLACK_WEBHOOK != ''
+      run: |
+        PAYLOAD="{\"text\":\"DevSecOps pipeline succeeded for $GITHUB_REPOSITORY on ${GITHUB_REF} (<${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|view run>)\"}"
+        curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" $SLACK_WEBHOOK || true
+
+    - name: Notify Slack (failure)
+      if: failure() && env.SLACK_WEBHOOK != ''
+      run: |
+        PAYLOAD="{\"text\":\"⚠️ DevSecOps pipeline FAILED for $GITHUB_REPOSITORY on ${GITHUB_REF} — <${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}|view run>\"}"
+        curl -sS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" $SLACK_WEBHOOK || true
+
